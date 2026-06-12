@@ -1,6 +1,6 @@
 use axum::{
     body::Body,
-    extract::State,
+    extract::{Request, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::post,
@@ -25,6 +25,19 @@ struct ApiKeys {
 struct AppState {
     client: Client,
     api_keys: ApiKeys,
+}
+
+fn auth(req: &Request) -> Option<String> {
+    let hdr = req
+        .headers()
+        .get("authorization")
+        .or_else(|| req.headers().get("x-api-key"))?;
+    let tok = hdr
+        .to_str()
+        .ok()?
+        .strip_prefix("Bearer ")
+        .unwrap_or(hdr.to_str().ok()?);
+    Some(tok.to_string())
 }
 
 fn check_auth(state: &AppState, token: &str) -> bool {
@@ -117,25 +130,18 @@ async fn handle_chat(
                     .body(Body::from_stream(stream))
                     .unwrap_or_default()
             } else {
-                match upstream_resp.bytes().await {
-                    Ok(bytes) => {
-                        let resp_body = serde_json::from_slice::<serde_json::Value>(&bytes)
-                            .unwrap_or(serde_json::json!({"error": "parse error"}));
-                        let code = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-                        (code, Json(resp_body)).into_response()
-                    }
-                    Err(e) => (StatusCode::BAD_GATEWAY, Json(serde_json::json!({
-                        "error": {"message": format!("upstream read error: {e}"), "type": "upstream_error"}
-                    }))).into_response(),
-                }
+                let bytes = upstream_resp.bytes().await.unwrap_or_default();
+                let resp_body: serde_json::Value =
+                    serde_json::from_slice(&bytes).unwrap_or(serde_json::json!({"error": "parse error"}));
+
+                (StatusCode::from_u16(status.as_u16()).unwrap(), Json(resp_body)).into_response()
             }
         }
-        Err(e) => {
-            let msg = format!("upstream error: {e}");
-            (StatusCode::BAD_GATEWAY, Json(serde_json::json!({
-                "error": {"message": msg, "type": "upstream_error"}
-            }))).into_response()
-        }
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({"error": {"message": format!("upstream error: {e}"), "type": "upstream_error"}})),
+        )
+            .into_response(),
     }
 }
 
@@ -185,7 +191,7 @@ async fn main() {
     let state = Arc::new(AppState {
         client: Client::builder()
             .timeout(std::time::Duration::from_secs(120))
-            .pool_max_idle_per_host(32)
+            .http1_only()
             .build()
             .expect("Failed to build HTTP client"),
         api_keys,
@@ -201,8 +207,6 @@ async fn main() {
     info!("opencode-proxy-rust listening on {addr}");
     println!("opencode-proxy-rust listening on {addr}");
 
-    let listener = tokio::net::TcpListener::bind(addr).await
-        .expect("failed to bind address, port probably in use");
-    axum::serve(listener, app).await
-        .expect("server exited");
+    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    axum::serve(listener, app).await.unwrap();
 }
