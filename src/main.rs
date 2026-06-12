@@ -1,6 +1,6 @@
 use axum::{
     body::Body,
-    extract::{Request, State},
+    extract::State,
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::post,
@@ -25,19 +25,6 @@ struct ApiKeys {
 struct AppState {
     client: Client,
     api_keys: ApiKeys,
-}
-
-fn auth(req: &Request) -> Option<String> {
-    let hdr = req
-        .headers()
-        .get("authorization")
-        .or_else(|| req.headers().get("x-api-key"))?;
-    let tok = hdr
-        .to_str()
-        .ok()?
-        .strip_prefix("Bearer ")
-        .unwrap_or(hdr.to_str().ok()?);
-    Some(tok.to_string())
 }
 
 fn check_auth(state: &AppState, token: &str) -> bool {
