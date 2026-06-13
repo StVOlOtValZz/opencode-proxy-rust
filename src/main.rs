@@ -3,7 +3,7 @@ use axum::{
     extract::{Request, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::post,
+    routing::{get, post},
     Json, Router,
 };
 use reqwest::Client;
@@ -12,9 +12,18 @@ use std::collections::HashMap;
 use std::fs;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tower_http::cors::CorsLayer;
 use tracing::{info, warn};
 use uuid::Uuid;
+
+const MODELS: &[&str] = &[
+    "deepseek-v4-flash-free",
+    "deepseek-v4-flash",
+    "mimo-v2.5-free",
+    "minimax-m3-free",
+    "nemotron-3-super-free",
+];
 
 #[derive(Debug, Clone, Deserialize)]
 struct ApiKeys {
@@ -27,21 +36,32 @@ struct AppState {
     api_keys: ApiKeys,
 }
 
-fn auth(req: &Request) -> Option<String> {
-    let hdr = req
-        .headers()
-        .get("authorization")
-        .or_else(|| req.headers().get("x-api-key"))?;
-    let tok = hdr
-        .to_str()
-        .ok()?
-        .strip_prefix("Bearer ")
-        .unwrap_or(hdr.to_str().ok()?);
-    Some(tok.to_string())
-}
-
 fn check_auth(state: &AppState, token: &str) -> bool {
     state.api_keys.keys.values().any(|k| k == token)
+}
+
+async fn handle_health() -> Response {
+    Json(serde_json::json!({
+        "status": "ok",
+        "version": "0.2.0",
+        "models": MODELS.len(),
+    }))
+    .into_response()
+}
+
+async fn handle_models() -> Response {
+    Json(serde_json::json!({
+        "object": "list",
+        "data": MODELS.iter().map(|id| {
+            serde_json::json!({
+                "id": id,
+                "object": "model",
+                "created": 1779000000,
+                "owned_by": "opencode-free",
+            })
+        }).collect::<Vec<_>>(),
+    }))
+    .into_response()
 }
 
 async fn handle_chat(
@@ -54,11 +74,7 @@ async fn handle_chat(
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
-        .or_else(|| {
-            headers
-                .get("x-api-key")
-                .and_then(|v| v.to_str().ok())
-        });
+        .or_else(|| headers.get("x-api-key").and_then(|v| v.to_str().ok()));
 
     let authed = tok.is_some_and(|t| check_auth(&state, t));
     if !authed {
@@ -74,14 +90,23 @@ async fn handle_chat(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    // Build upstream request
-    let zen_body = serde_json::json!({
-        "model": body.get("model"),
-        "messages": body.get("messages"),
-        "stream": is_stream,
-        "tools": body.get("tools"),
-        "tool_choice": body.get("tool_choice"),
-    });
+    // Build upstream request — strip null fields to avoid upstream rejection
+    let mut zen_body = serde_json::Map::new();
+    if let Some(model) = body.get("model") {
+        zen_body.insert("model".into(), model.clone());
+    }
+    if let Some(messages) = body.get("messages") {
+        zen_body.insert("messages".into(), messages.clone());
+    }
+    zen_body.insert("stream".into(), serde_json::Value::Bool(is_stream));
+    if let Some(tools) = body.get("tools") {
+        if tools.as_array().map_or(false, |a| !a.is_empty()) {
+            zen_body.insert("tools".into(), tools.clone());
+        }
+    }
+    if let Some(tc) = body.get("tool_choice") {
+        zen_body.insert("tool_choice".into(), tc.clone());
+    }
 
     let request_id = Uuid::new_v4().to_string();
 
@@ -90,7 +115,7 @@ async fn handle_chat(
     zen_headers.insert("authorization", "Bearer public".parse().unwrap());
     zen_headers.insert(
         "user-agent",
-        format!("opencode-proxy-rust/0.1").parse().unwrap(),
+        "opencode-proxy-rust/0.2".parse().unwrap(),
     );
     zen_headers.insert("x-opencode-client", "proxy".parse().unwrap());
     zen_headers.insert("x-opencode-request", request_id.parse().unwrap());
@@ -99,49 +124,95 @@ async fn handle_chat(
         format!("ses_{}", &request_id[..12]).parse().unwrap(),
     );
 
-    let upstream_req = state
+    // Timeout for the entire upstream request
+    let upstream_fut = state
         .client
         .post("https://opencode.ai/zen/v1/chat/completions")
         .headers(zen_headers)
-        .json(&zen_body);
+        .json(&zen_body)
+        .send();
 
-    match upstream_req.send().await {
-        Ok(upstream_resp) => {
-            let status = upstream_resp.status();
-
-            if is_stream {
-                use futures_util::StreamExt;
-                // reqwest bytes_stream -> map to io::Result
-                let stream = upstream_resp.bytes_stream()
-                    .map(|r| r.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)))
-                    .filter_map(|r| async move {
-                        match r {
-                            Ok(b) if !b.is_empty() => Some(Ok(b)),
-                            Ok(_) => None,
-                            Err(e) => Some(Err(e)),
-                        }
-                    });
-
-                Response::builder()
-                    .status(StatusCode::OK)
-                    .header("content-type", "text/event-stream")
-                    .header("cache-control", "no-cache")
-                    .header("x-accel-buffering", "no")
-                    .body(Body::from_stream(stream))
-                    .unwrap_or_default()
-            } else {
-                let bytes = upstream_resp.bytes().await.unwrap_or_default();
-                let resp_body: serde_json::Value =
-                    serde_json::from_slice(&bytes).unwrap_or(serde_json::json!({"error": "parse error"}));
-
-                (StatusCode::from_u16(status.as_u16()).unwrap(), Json(resp_body)).into_response()
-            }
+    let upstream_resp = match tokio::time::timeout(Duration::from_secs(55), upstream_fut).await {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => {
+            warn!("upstream request error: {e}");
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({"error": {
+                    "message": format!("upstream error: {e}"),
+                    "type": "upstream_error"
+                }})),
+            )
+                .into_response();
         }
-        Err(e) => (
-            StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({"error": {"message": format!("upstream error: {e}"), "type": "upstream_error"}})),
-        )
-            .into_response(),
+        Err(_) => {
+            warn!("upstream request timed out after 55s");
+            return (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(serde_json::json!({"error": {
+                    "message": "upstream request timed out",
+                    "type": "timeout_error"
+                }})),
+            )
+                .into_response();
+        }
+    };
+
+    let status = upstream_resp.status();
+
+    if is_stream {
+        use futures_util::StreamExt;
+
+        let stream = upstream_resp
+            .bytes_stream()
+            .map(|r| match r {
+                Ok(b) => Ok(b),
+                Err(e) => {
+                    warn!("upstream stream error: {e}");
+                    Err(std::io::Error::new(std::io::ErrorKind::Other, e))
+                }
+            });
+
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "text/event-stream")
+            .header("cache-control", "no-cache")
+            .header("x-accel-buffering", "no")
+            .body(Body::from_stream(stream))
+            .unwrap_or_else(|_| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": {"message": "failed to build stream response"}})),
+                )
+                    .into_response()
+            })
+    } else {
+        let bytes = match tokio::time::timeout(Duration::from_secs(55), upstream_resp.bytes()).await
+        {
+            Ok(Ok(b)) => b,
+            Ok(Err(e)) => {
+                warn!("upstream body read error: {e}");
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(serde_json::json!({"error": {"message": format!("upstream body error: {e}")}})),
+                )
+                    .into_response();
+            }
+            Err(_) => {
+                warn!("upstream body read timed out");
+                return (
+                    StatusCode::GATEWAY_TIMEOUT,
+                    Json(serde_json::json!({"error": {"message": "upstream body timed out"}})),
+                )
+                    .into_response();
+            }
+        };
+
+        let resp_body: serde_json::Value =
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::json!({"error": "parse error"}));
+
+        (StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY), Json(resp_body))
+            .into_response()
     }
 }
 
@@ -171,7 +242,7 @@ fn generate_keys(path: &str) -> ApiKeys {
     ApiKeys { keys: map }
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -190,7 +261,8 @@ async fn main() {
 
     let state = Arc::new(AppState {
         client: Client::builder()
-            .timeout(std::time::Duration::from_secs(120))
+            .timeout(Duration::from_secs(60))
+            .connect_timeout(Duration::from_secs(10))
             .http1_only()
             .build()
             .expect("Failed to build HTTP client"),
@@ -200,6 +272,8 @@ async fn main() {
     let app = Router::new()
         .route("/v1/chat/completions", post(handle_chat))
         .route("/zen/v1/chat/completions", post(handle_chat))
+        .route("/health", get(handle_health))
+        .route("/v1/models", get(handle_models))
         .layer(CorsLayer::permissive())
         .with_state(state);
 
