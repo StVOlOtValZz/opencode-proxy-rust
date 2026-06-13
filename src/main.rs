@@ -191,6 +191,13 @@ async fn handle_chat(
                     warn!("upstream stream error: {e}");
                     Err(std::io::Error::new(std::io::ErrorKind::Other, e))
                 }
+            })
+            .filter_map(|r| async move {
+                match r {
+                    Ok(b) if !b.is_empty() => Some(Ok(b)),
+                    Ok(_) => None,
+                    Err(e) => Some(Err(e)),
+                }
             });
 
         Response::builder()
