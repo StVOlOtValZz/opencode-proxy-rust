@@ -1,6 +1,6 @@
 use axum::{
     body::Body,
-    extract::State,
+    extract::{Request, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -159,6 +159,26 @@ async fn handle_chat(
     };
 
     let status = upstream_resp.status();
+
+    // If upstream returned an error, return it as-is regardless of stream mode
+    if !status.is_success() {
+        let bytes = match tokio::time::timeout(Duration::from_secs(10), upstream_resp.bytes()).await
+        {
+            Ok(Ok(b)) => b,
+            _ => {
+                warn!("failed to read upstream error body");
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(serde_json::json!({"error": {"message": "upstream error"}})),
+                )
+                    .into_response();
+            }
+        };
+        let resp_body: serde_json::Value =
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::json!({"error": "upstream error"}));
+        return (StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY), Json(resp_body))
+            .into_response();
+    }
 
     if is_stream {
         use futures_util::StreamExt;
