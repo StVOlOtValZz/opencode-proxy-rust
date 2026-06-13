@@ -69,6 +69,15 @@ async fn handle_chat(
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
+    // Log incoming request summary
+    let req_body_str = serde_json::to_string(&body).unwrap_or_default();
+    info!("REQ: model={} stream={} body_len={} body_preview={}",
+        body.get("model").and_then(|m| m.as_str()).unwrap_or("?"),
+        body.get("stream").and_then(|s| s.as_bool()).unwrap_or(false),
+        req_body_str.len(),
+        &req_body_str[..std::cmp::min(200, req_body_str.len())]
+    );
+
     // Auth
     let tok = headers
         .get("authorization")
