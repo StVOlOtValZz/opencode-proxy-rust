@@ -193,8 +193,10 @@ async fn do_upstream(
                 let resp_body: serde_json::Value =
                     serde_json::from_slice(&bytes).unwrap_or(serde_json::json!({"error": "parse error"}));
 
+                // On 429 and have retries left, try next token
                 if status == StatusCode::TOO_MANY_REQUESTS && has_429(&resp_body) && retry_count > 0 {
-                    warn!("upstream 429 with token {}, retrying ({} left)", bear_token, retry_count - 1);
+                    warn!("upstream 429 with token {}, retrying with next token ({} left)", bear_token, retry_count - 1);
+                    // Try again with next token
                     return Box::pin(do_upstream(state, body, false, retry_count - 1)).await;
                 }
 
@@ -224,13 +226,16 @@ async fn handle_chat(
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
+    // Log incoming request summary
     let req_body_str = serde_json::to_string(&body).unwrap_or_default();
-    info!("REQ: model={} stream={} body_len={}",
+    info!("REQ: model={} stream={} body_len={} body_preview={}",
         body.get("model").and_then(|m| m.as_str()).unwrap_or("?"),
         body.get("stream").and_then(|s| s.as_bool()).unwrap_or(false),
         req_body_str.len(),
+        &req_body_str[..std::cmp::min(200, req_body_str.len())]
     );
 
+    // Auth
     let tok = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
@@ -250,6 +255,7 @@ async fn handle_chat(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
+    // Retry on 429 with next token (max 3 retries = 4 different tokens tried)
     do_upstream(&state, &body, is_stream, 3).await
 }
 
@@ -321,15 +327,32 @@ async fn main() {
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    info!("opencode-proxy-rust v0.3 listening on {addr} (tokens={})", upstream_token_count);
-    println!("opencode-proxy-rust v0.3 listening on {addr} (tokens={})", upstream_token_count);
+    info!(
+        "opencode-proxy-rust v0.3 listening on {addr} (upstream_tokens={}, pool=32, idle_timeout=30s)",
+        upstream_token_count
+    );
+    println!(
+        "opencode-proxy-rust v0.3 listening on {addr} (upstream_tokens={})",
+        upstream_token_count
+    );
 
-    let listener = tokio::net::TcpListener::bind(addr).await.expect("bind failed");
+    let listener = tokio::net::TcpListener::bind(addr).await.unwrap_or_else(|e| {
+        panic!("Failed to bind to {addr}: {e}");
+    });
 
+    // Graceful shutdown
     axum::serve(listener, app)
         .with_graceful_shutdown(async {
-            tokio::signal::ctrl_c().await.ok();
+            let ctrl_c = tokio::signal::ctrl_c();
+            let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("failed to install SIGTERM handler");
+            tokio::select! {
+                _ = ctrl_c => info!("SIGINT received, shutting down"),
+                _ = term.recv() => info!("SIGTERM received, shutting down"),
+            }
         })
         .await
-        .unwrap_or_else(|e| warn!("Server error: {e}"));
+        .unwrap_or_else(|e| {
+            warn!("Server error: {e}");
+        });
 }
